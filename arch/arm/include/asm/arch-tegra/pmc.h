@@ -388,6 +388,10 @@ struct pmc_ctlr {
 /* APBDEV_PMC_CNTRL2_0 0x440 */
 #define HOLD_CKE_LOW_EN				(1 << 12)
 
+/* APBDEV_PMC_SCRATCH0_0 0x50 */
+#define PMC_SCRATCH0_RECOVERY_MODE		(1 << 31)
+#define PMC_SCRATCH0_FASTBOOT_MODE		(1 << 30)
+
 /* PMC read/write functions */
 u32 tegra_pmc_readl(unsigned long offset);
 void tegra_pmc_writel(u32 value, unsigned long offset);

@@ -181,6 +181,11 @@ int board_init(void)
 	/* prepare the WB code to LP0 location */
 	warmboot_prepare_code(TEGRA_LP0_ADDR, TEGRA_LP0_SIZE);
 #endif
+
+#ifdef CONFIG_CMD_FASTBOOT
+	tegra_detect_boot_mode();
+#endif
+
 	return nvidia_board_init();
 }
 
@@ -223,6 +228,34 @@ int board_early_init_f(void)
 	return 0;
 }
 #endif	/* EARLY_INIT */
+
+#ifdef CONFIG_CMD_FASTBOOT
+void tegra_detect_boot_mode(void)
+{
+	struct pmc_ctlr *const pmc = (struct pmc_ctlr *)NV_PA_PMC_BASE;
+	u32 reg;
+	int ret;
+
+ 	reg = readl(&pmc->pmc_scratch0);
+
+ 	/* Should clear the boot flag in pmc_scratch0 first */
+	writel(reg & (~(PMC_SCRATCH0_FASTBOOT_MODE | PMC_SCRATCH0_RECOVERY_MODE)),
+			&pmc->pmc_scratch0);
+
+ 	if (reg & PMC_SCRATCH0_FASTBOOT_MODE) {
+		printf("Entering fastboot mode\n");
+		ret = enter_fastboot();
+		if (ret)
+			printf("Failed to enter fastboot mode");
+	} else if (reg & PMC_SCRATCH0_RECOVERY_MODE) {
+		printf("Entering recovery mode\n");
+		setenv("recovery", "1");
+	} else {
+		printf("Entering normal boot mode\n");
+		setenv("recovery", "0");
+	}
+}
+#endif
 
 int board_late_init(void)
 {

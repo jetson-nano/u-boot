@@ -13,7 +13,7 @@
 #include <g_dnl.h>
 #include <usb.h>
 
-static int do_fastboot(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
+int enter_fastboot(void)
 {
 	int controller_index;
 	char *usb_controller;
@@ -59,6 +59,12 @@ exit:
 	board_usb_cleanup(controller_index, USB_INIT_DEVICE);
 
 	return ret;
+
+ }
+
+ static int do_fastboot(cmd_tbl_t *cmdtp, int flag, int argc, char *const argv[])
+{
+	return enter_fastboot();
 }
 
 U_BOOT_CMD(

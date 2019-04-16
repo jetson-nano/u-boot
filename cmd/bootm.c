@@ -25,6 +25,9 @@
 #include <linux/kernel.h>
 #include <linux/sizes.h>
 #include <u-boot/zlib.h>
+#include <android_image.h>
+#include <part.h>
+#include <libfdt.h>
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -801,3 +804,282 @@ U_BOOT_CMD(
 	"boot arm64 Linux Image image from memory", booti_help_text
 );
 #endif	/* CONFIG_CMD_BOOTI */
+
+#ifdef CONFIG_CMD_BOOTA
+
+ /*******************************************************************/
+/* boota - support boot in Android Manner */
+/*******************************************************************/
+
+ static int boota_ram_setup(cmd_tbl_t *cmdtp, int flag, int argc,
+		char * const argv[])
+{
+	struct andr_img_hdr *boot_hdr;
+	struct fdt_header *fdt_hdr;
+	ulong kernel_addr;
+	ulong ramdisk_addr;
+	ulong fdt_addr;
+	fdt32_t fdt_len;
+	ulong k_addr_user;
+	ulong r_addr_user;
+	ulong d_addr_user;
+	int ret;
+
+ 	if (argc < 4) {
+		puts("Insufficient arguments specified for 'boota ram' call!\n");
+		return -1;
+	} else {
+		puts("\nBooting Android from RAM\n");
+		boot_hdr = (struct andr_img_hdr *)simple_strtoul(argv[2], NULL, 16);
+		fdt_hdr = (struct fdt_header *)simple_strtoul(argv[3], NULL, 16);
+	}
+
+ 	ret = memcmp(boot_hdr->magic, ANDR_BOOT_MAGIC, 8);
+	if (ret != 0) {
+		puts("Invalid Android boot image magic\n");
+		return 1;
+	}
+
+ 	ret = fdt_check_header(fdt_hdr);
+	if (ret) {
+		puts("Invalid device tree magic or version\n");
+		return 1;
+	}
+
+ 	kernel_addr = getenv_ulong("kernel_addr_r", 16, 0);
+	if (!kernel_addr) {
+		puts("kernel_addr_r isn't specified in env and use header's instead\n");
+		kernel_addr = boot_hdr->kernel_addr;
+	}
+	ramdisk_addr = getenv_ulong("ramdisk_addr_r", 16, 0);
+	if (!ramdisk_addr) {
+		puts("ramdisk_addr_r isn't specified in env and use header's instead\n");
+		ramdisk_addr = boot_hdr->ramdisk_addr;
+	}
+	fdt_addr = getenv_ulong("fdt_addr_r", 16, 0);
+	if (!fdt_addr) {
+		puts("Invalid fdt_addr_r in boot env\n");
+		return 1;
+	}
+
+ 	k_addr_user = (ulong)boot_hdr + boot_hdr->page_size;
+	r_addr_user = k_addr_user + ALIGN(boot_hdr->kernel_size, boot_hdr->page_size);
+	d_addr_user = (ulong)fdt_hdr;
+
+ 	fdt_len = fdt_totalsize(fdt_hdr);
+	memmove((void *)kernel_addr, (void *)k_addr_user, boot_hdr->kernel_size);
+	memmove((void *)ramdisk_addr, (void *)r_addr_user, boot_hdr->ramdisk_size);
+	memmove((void *)fdt_addr, (void *)d_addr_user, fdt_len);
+
+ 	/* Add cmdline to bootargs */
+	if (boot_hdr->cmdline) {
+		char temp[1024]; /* twice the size as normal */
+		char *append = getenv("bootargs_append");
+		if (append) {
+			snprintf(temp, "%s %s", append, boot_hdr->cmdline);
+			setenv("bootargs", temp);
+		}
+	}
+
+ 	images.ep = kernel_addr;
+	images.rd_start = ramdisk_addr;
+	images.rd_end = ramdisk_addr + boot_hdr->ramdisk_size;
+	images.ft_len = fdt_len;
+	images.ft_addr = (void *)fdt_addr;
+	images.os.os = IH_OS_LINUX;
+
+ 	return 0;
+}
+
+ static int boota_non_ram_setup(cmd_tbl_t *cmdtp, int flag, int argc,
+		char * const argv[])
+{
+	struct andr_img_hdr *boot_hdr =
+		(struct andr_img_hdr *)CONFIG_ANDROID_BOOT_HDR_BUFF;
+	struct fdt_header *fdt_hdr =
+		(struct fdt_header *)CONFIG_ANDROID_DT_HDR_BUFF;
+	char *dev_type;
+	int dev_num;
+	char ptn[16];
+	block_dev_desc_t *dev_desc;
+	disk_partition_t info;
+	ulong sector;
+	ulong kernel_addr;
+	ulong ramdisk_addr;
+	ulong fdt_addr;
+	fdt32_t fdt_len;
+	ulong num_sectors;
+	int ret;
+
+ 	if (argc < 3) {
+		puts("Insufficient arguments specified for boota non-ram call!\n");
+		return -1;
+	} else {
+		dev_type = argv[1];
+		dev_num = simple_strtoul(argv[2], NULL, 10);
+		printf("\nBooting Android from %s%d\n", dev_type, dev_num);
+	}
+
+ 	dev_desc = get_dev(dev_type, dev_num);
+	if (!dev_desc || dev_desc->type == DEV_TYPE_UNKNOWN) {
+		printf("Invalid or unknown boot device %s%d\n", dev_type, dev_num);
+		return 1;
+	}
+
+ 	strcpy(ptn, (getenv_yesno("recovery") == 1) ?
+			CONFIG_CMD_BOOTA_RECOVERY_PART : CONFIG_CMD_BOOTA_BOOT_PART);
+
+ 	/* Read Android boot image header from partition */
+	ret = get_partition_info_efi_by_name(dev_desc, ptn, &info);
+	if (ret) {
+		printf("Could not find '%s' partition\n", ptn);
+		return 1;
+	}
+	num_sectors = DIV_ROUND_UP(sizeof(struct andr_img_hdr), info.blksz);
+	ret = dev_desc->block_read(dev_desc->dev, info.start, num_sectors,
+			(void *)boot_hdr);
+	if (ret < 0) {
+		puts("Failed to read boot image header\n");
+		return 1;
+	}
+	if (memcmp(boot_hdr->magic, ANDR_BOOT_MAGIC, 8)) {
+		puts("Invalid Android boot image magic\n");
+		return 1;
+	}
+
+ 	/* Read kernel */
+	sector = info.start + (boot_hdr->page_size / info.blksz);
+	num_sectors = DIV_ROUND_UP(boot_hdr->kernel_size, info.blksz);
+	kernel_addr = getenv_ulong("kernel_addr_r", 16, 0);
+	if (!kernel_addr) {
+		puts("kernel_addr_r isn't specified in env and use header's instead\n");
+		kernel_addr = boot_hdr->kernel_addr;
+	}
+	ret = dev_desc->block_read(dev_desc->dev, sector, num_sectors,
+			(void *)kernel_addr);
+	if (ret < 0) {
+		puts("Failed to read kernel image\n");
+		return 1;
+	}
+
+ 	/* Read ramdisk */
+	sector += ALIGN(boot_hdr->kernel_size, boot_hdr->page_size) / info.blksz;
+	num_sectors = DIV_ROUND_UP(boot_hdr->ramdisk_size, info.blksz);
+	ramdisk_addr = getenv_ulong("ramdisk_addr_r", 16, 0);
+	if (!ramdisk_addr) {
+		puts("ramdisk_addr_r isn't specified in env and use header's instead\n");
+		ramdisk_addr = boot_hdr->ramdisk_addr;
+	}
+	ret = dev_desc->block_read(dev_desc->dev, sector, num_sectors,
+			(void *)ramdisk_addr);
+	if (ret < 0) {
+		puts("Failed to read ramdisk image\n");
+		return 1;
+	}
+
+ 	/* Read device tree header from partition */
+	strcpy(ptn, CONFIG_CMD_BOOTA_DT_PART);
+	ret = get_partition_info_efi_by_name(dev_desc, ptn, &info);
+	if (ret) {
+		printf("Could not find '%s' partition\n",ptn);
+		return 1;
+	}
+	num_sectors = DIV_ROUND_UP(sizeof(struct fdt_header), info.blksz);
+	ret = dev_desc->block_read(dev_desc->dev, info.start, num_sectors,
+			(void *)fdt_hdr);
+	if (ret < 0) {
+		puts("Failed to read device tree header\n");
+		return 1;
+	}
+	ret = fdt_check_header(fdt_hdr);
+	if (ret) {
+		puts("Invalid device tree magic or version\n");
+		return 1;
+	}
+
+ 	/* Read device tree */
+	fdt_len = fdt_totalsize(fdt_hdr);
+	num_sectors = DIV_ROUND_UP(fdt_len, info.blksz);
+	fdt_addr = getenv_ulong("fdt_addr_r", 16, 0);
+	if (!fdt_addr) {
+		puts("Invalid fdt_addr_r in boot env\n");
+		return 1;
+	}
+	ret = dev_desc->block_read(dev_desc->dev, info.start, num_sectors,
+			(void *)fdt_addr);
+	if (ret < 0) {
+		puts("Failed to read device tree\n");
+		return 1;
+	}
+
+ 	/* Add cmdline to bootargs */
+	if (boot_hdr->cmdline) {
+		char temp[1024]; /* twice the size as normal */
+		char *append = getenv("bootargs_append");
+		if (append) {
+			snprintf(temp, "%s %s", append, boot_hdr->cmdline);
+			setenv("bootargs", temp);
+		}
+	}
+
+ 	images.ep = kernel_addr;
+	images.rd_start = ramdisk_addr;
+	images.rd_end = ramdisk_addr + boot_hdr->ramdisk_size;
+	images.ft_len = fdt_len;
+	images.ft_addr = (void *)fdt_addr;
+	images.os.os = IH_OS_LINUX;
+
+ 	printf("kernel  is loading     @ %08lx (%d bytes)\n",
+			kernel_addr, boot_hdr->kernel_size);
+	printf("ramdisk is loading     @ %08lx (%d bytes)\n",
+			ramdisk_addr, boot_hdr->ramdisk_size);
+	printf("dt      is loading     @ %08lx (%d bytes)\n",
+			fdt_addr, fdt_len);
+
+ 	return 0;
+}
+
+ int do_boota(cmd_tbl_t *cmdtp, int flag, int argc, char * const argv[])
+{
+	int ret;
+
+ 	if (argc < 3) {
+		puts("Insufficient arguments specified!\n");
+		return -1;
+	}
+
+ 	ret = do_bootm_states(cmdtp, flag, argc, argv, BOOTM_STATE_START,
+			&images, 1);
+	if (ret)
+		return 1;
+
+ 	if ((strcmp(argv[1], "ram")) == 0)
+		ret = boota_ram_setup(cmdtp, flag, argc, argv);
+	else
+		ret = boota_non_ram_setup(cmdtp, flag, argc, argv);
+	if (ret)
+		return ret;
+
+ 	/*
+	 * We are doing the BOOTM_STATE_LOADOS state ourselves, so must
+	 * disable interrupts by ourselves
+	 */
+	bootm_disable_interrupts();
+
+ 	ret = do_bootm_states(cmdtp, flag, argc, argv,
+			BOOTM_STATE_OS_PREP | BOOTM_STATE_OS_FAKE_GO |
+			BOOTM_STATE_OS_GO,
+			&images, 1);
+	return ret;
+}
+
+ U_BOOT_CMD(
+	boota,	CONFIG_SYS_MAXARGS,	1,	do_boota,
+	"boot android bootimg from memory or storage",
+	"ram <bootimg_addr> <dtb_addr> or <dev_type> <dev_num>\n"
+	"\t 'bootimg_addr' means boot image address in RAM\n"
+	"\t 'dtb_addr' means device tree address in RAM\n"
+	"\t 'dev_type' means the type of boot device\n"
+	"\t 'dev_num' means the instance of boot device\n"
+);
+#endif	/* CONFIG_CMD_BOOTA */
